@@ -1,0 +1,1457 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+scripts/review_gui.py
+Interaktívne webové & mobilné riadiace centrum lokalizácie ETS2/ATS.
+Umožňuje:
+  1. Kompletné riadenie pipeline krokov (extrakcia, draft, review, merge) z webového rozhrania.
+  2. Živé sledovanie stavu glosárov, nepreložených reťazcov a finálneho XLIFF.
+  3. Pohodlné schvaľovanie na mobile aj PC s automatickým ukladaním.
+"""
+
+import os
+import sys
+import json
+import time
+import socket
+import webbrowser
+import subprocess
+from http.server import HTTPServer, BaseHTTPRequestHandler
+from urllib.parse import urlparse
+
+sys.stdout.reconfigure(encoding='utf-8')
+
+sys.path.insert(0, os.path.dirname(__file__))
+import prepare_review
+import merge_to_xliff
+
+REVIEW_MD = "review/preklady_review.md"
+APPROVED_JSON = "data/temp/approved_translations.json"
+UNTRANSLATED_CSV = "data/temp/untranslated_strings.csv"
+TRANSLATIONS_JSON = "data/temp/translations_complete.json"
+
+def get_local_ip():
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(('10.255.255.255', 1))
+        ip = s.getsockname()[0]
+    except Exception:
+        ip = '127.0.0.1'
+    finally:
+        s.close()
+    return ip
+
+def get_free_port(preferred=8080):
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.bind(('', preferred))
+        port = s.getsockname()[1]
+        s.close()
+        return port
+    except OSError:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.bind(('', 0))
+        port = s.getsockname()[1]
+        s.close()
+        return port
+
+def get_pipeline_status():
+    """Zozbiera detailný stav všetkých súborov v procese."""
+    status = {}
+
+    # 1. Vstupný súbor
+    inp = "data/input/SCS Trucks_sk.xliff"
+    if not os.path.exists(inp) and os.path.exists("SCS Trucks_sk.xliff"):
+        inp = "SCS Trucks_sk.xliff"
+    if os.path.exists(inp):
+        st = os.stat(inp)
+        status["input"] = {
+            "exists": True,
+            "path": inp,
+            "size_mb": round(st.st_size / (1024 * 1024), 1),
+            "modified": time.strftime("%d.%m.%Y %H:%M", time.localtime(st.st_mtime))
+        }
+    else:
+        status["input"] = {"exists": False, "path": inp, "size_mb": 0, "modified": "Chýba"}
+
+    # 2. Glosáre
+    ets2_gl = "data/glossaries/ets2_glossary.txt"
+    ats_gl = "data/glossaries/ats_glossary.txt"
+    ets2_count = 0
+    ats_count = 0
+    if os.path.exists(ets2_gl):
+        with open(ets2_gl, "r", encoding="utf-8") as f:
+            ets2_count = f.read().count("---")
+    if os.path.exists(ats_gl):
+        with open(ats_gl, "r", encoding="utf-8") as f:
+            ats_count = f.read().count("---")
+    status["glossaries"] = {
+        "exists": os.path.exists(ets2_gl) or os.path.exists(ats_gl),
+        "ets2_count": ets2_count,
+        "ats_count": ats_count
+    }
+
+    # 3. Nepreložené reťazce
+    untrans = "data/temp/untranslated_strings.csv"
+    untrans_count = 0
+    if os.path.exists(untrans):
+        import csv
+        with open(untrans, "r", encoding="utf-8-sig") as f:
+            untrans_count = len(list(csv.DictReader(f)))
+        st = os.stat(untrans)
+        status["untranslated"] = {
+            "exists": True,
+            "count": untrans_count,
+            "modified": time.strftime("%d.%m.%Y %H:%M", time.localtime(st.st_mtime))
+        }
+    else:
+        status["untranslated"] = {"exists": False, "count": 0, "modified": "-"}
+
+    # 4. Review dokument
+    review_md = "review/preklady_review.md"
+    rev_total = 0
+    rev_checked = 0
+    if os.path.exists(review_md):
+        with open(review_md, "r", encoding="utf-8") as f:
+            for l in f:
+                ls = l.strip()
+                if ls.startswith("### [Položka"):
+                    rev_total += 1
+                elif ls.startswith("- [x]") or ls.startswith("- [X]"):
+                    rev_checked += 1
+        pct = round((rev_checked / rev_total * 100) if rev_total else 0, 1)
+        status["review"] = {
+            "exists": True,
+            "total": rev_total,
+            "approved": rev_checked,
+            "pending": rev_total - rev_checked,
+            "percent": pct
+        }
+    else:
+        status["review"] = {"exists": False, "total": 0, "approved": 0, "pending": 0, "percent": 0}
+
+    # 5. Finálny výstup a schválené
+    out_xl = "data/output/SCS Trucks_sk_FINAL.xliff"
+    app_store = "data/temp/approved_translations.json"
+    app_count = 0
+    if os.path.exists(app_store):
+        try:
+            with open(app_store, "r", encoding="utf-8") as f:
+                app_count = len(json.load(f))
+        except Exception:
+            pass
+
+    if os.path.exists(out_xl):
+        st = os.stat(out_xl)
+        status["output"] = {
+            "exists": True,
+            "path": out_xl,
+            "size_mb": round(st.st_size / (1024 * 1024), 1),
+            "approved_count": app_count,
+            "modified": time.strftime("%d.%m.%Y %H:%M", time.localtime(st.st_mtime))
+        }
+    else:
+        status["output"] = {"exists": False, "path": out_xl, "approved_count": app_count, "size_mb": 0, "modified": "-"}
+
+    return status
+
+def load_data():
+    """Načíta položky z review súboru a csv."""
+    items_data = []
+    
+    if not os.path.exists(REVIEW_MD):
+        prepare_review.generate_review_file(
+            UNTRANSLATED_CSV, TRANSLATIONS_JSON, APPROVED_JSON, REVIEW_MD
+        )
+
+    cards = prepare_review.parse_existing_review_md(REVIEW_MD)
+
+    import csv
+    if os.path.exists(UNTRANSLATED_CSV):
+        with open(UNTRANSLATED_CSV, "r", encoding="utf-8-sig") as f:
+            csv_items = list(csv.DictReader(f))
+    else:
+        csv_items = []
+
+    approved_store = {}
+    if os.path.exists(APPROVED_JSON):
+        try:
+            with open(APPROVED_JSON, "r", encoding="utf-8") as f:
+                approved_store = json.load(f)
+        except Exception:
+            pass
+
+    for idx, it in enumerate(csv_items):
+        item_no = idx + 1
+        uid = it.get("id", "")
+        ctx_raw = it.get("group_or_context", "")
+        key = ctx_raw.split("]")[0].replace("[Key: ", "").strip() if "[Key:" in ctx_raw else ""
+        ctx_clean = prepare_review.clean_context_desc(ctx_raw)
+        
+        card_info = cards.get(uid, {})
+        is_approved = card_info.get("approved", False) or (uid in approved_store)
+        sk_text = card_info.get("sk") or approved_store.get(uid) or ""
+        # Normalizácia pomlčiek
+        sk_text = sk_text.replace('\u2013', '-').replace('\u2014', '-')
+        
+        items_data.append({
+            "item_no": item_no,
+            "id": uid,
+            "key": key,
+            "en": it.get("source_en", ""),
+            "sk": sk_text,
+            "context": ctx_clean,
+            "chapter": prepare_review.get_item_chapter(it),
+            "approved": is_approved,
+            "already_merged": uid in approved_store,
+            "notes": card_info.get("notes", [])
+        })
+
+    return items_data
+
+def save_data(items_data):
+    """Uloží upravené dáta späť do review/preklady_review.md so zákazom pomlčky –."""
+    if not os.path.exists(UNTRANSLATED_CSV):
+        return
+
+    import csv
+    with open(UNTRANSLATED_CSV, "r", encoding="utf-8-sig") as f:
+        csv_items = list(csv.DictReader(f))
+
+    items_dict = {it["id"]: it for it in items_data}
+    total_count = len(csv_items)
+
+    all_chapters = []
+    for c in prepare_review.CHAPTER_DEFINITIONS:
+        if any(it.get("chapter") == c for it in items_data):
+            all_chapters.append(c)
+    for it in items_data:
+        ch = it.get("chapter", "Ostatné")
+        if ch not in all_chapters:
+            all_chapters.append(ch)
+
+    md = []
+    md.append("# 📋 Návrh lokalizácie ETS2 & ATS – Review & Schvaľovanie\n\n")
+    md.append("> [!IMPORTANT]\n")
+    md.append("> **Inkrementálny proces schvaľovania (Human-in-the-Loop):**\n")
+    md.append("> 1. **Schválenie:** Označ preklad ako schválený zaškrtnutím `- [x] Schválené`.\n")
+    md.append("> 2. **Úprava prekladu:** Text prekladu je možné upraviť priamo v riadku `* **SK:** ...`.\n")
+    md.append("> 3. **Zlúčenie schválených:** Spusti `python run_pipeline.py merge` — do finálneho XLIFF sa zapíšu **len zaškrtnuté položky** (`- [x]`).\n")
+    md.append("> 4. **Ďalšie kolo review:** Spusti `python run_pipeline.py draft` — schválené položky sa odfiltrujú.\n\n")
+
+    total_approved = sum(1 for it in items_data if it.get("approved"))
+    pct = (total_approved / total_count * 100) if total_count else 0
+
+    md.append("## 📊 Celkový progres schvaľovania\n\n")
+    md.append(f"* **Celkový počet reťazcov v projekte:** {total_count}\n")
+    md.append(f"* **Schválené na zlúčenie / zlúčené:** {total_approved} ({pct:.1f} %)\n")
+    md.append(f"* **Zostáva na schválenie:** {total_count - total_approved}\n\n")
+
+    md.append("### Prehľad podľa kapitol\n\n")
+    md.append("| Kapitola | Spolu | Schválené | Zostáva na review | Stav |\n")
+    md.append("| :--- | :---: | :---: | :---: | :---: |\n")
+
+    for title in all_chapters:
+        chapter_items = [it for it in items_data if it.get("chapter") == title]
+        chapter_total = len(chapter_items)
+        chapter_approved = sum(1 for it in chapter_items if it.get("approved"))
+        chapter_pending = chapter_total - chapter_approved
+        status_str = "✅ Kompletné (100 %)" if chapter_pending == 0 else (f"🔄 Rozpracované ({chapter_approved}/{chapter_total})" if chapter_approved > 0 else "⏳ Čaká na review")
+        md.append(f"| {title} | **{chapter_total}** | {chapter_approved} | {chapter_pending} | {status_str} |\n")
+
+    md.append(f"| **Spolu** | **{total_count}** | **{total_approved}** | **{total_count - total_approved}** | **{pct:.1f} % hotovo** |\n\n")
+    md.append("---\n\n")
+
+    for title in all_chapters:
+        chapter_entries = [it for it in items_data if it.get("chapter") == title]
+        if not chapter_entries:
+            continue
+        md.append(f"## {title}\n\n")
+        
+        for entry in chapter_entries:
+            item_no = entry["item_no"]
+            uid = entry["id"]
+            key = entry["key"]
+            en = entry["en"]
+            sk = (entry["sk"] or "").replace('\u2013', '-').replace('\u2014', '-')
+            ctx = entry.get("context", "")
+            cb = "x" if entry.get("approved") else " "
+
+            md.append(f"### [Položka {item_no}] ID: `{uid}` | `{key}`\n")
+            md.append(f"- [{cb}] Schválené\n")
+            md.append(f"* **EN:** {en}\n")
+            md.append(f"* **SK:** {sk}\n")
+            if ctx:
+                md.append(f"* *Kontext:* {ctx}\n")
+            for note in entry.get("notes", []):
+                md.append(f"{note}\n")
+            md.append("\n")
+
+        md.append("---\n\n")
+
+    with open(REVIEW_MD, "w", encoding="utf-8") as f:
+        f.write("".join(md))
+
+HTML_TEMPLATE = r"""<!DOCTYPE html>
+<html lang="sk">
+<head>
+  <meta charset="UTF-8">
+  <title>ETS2 & ATS – Riadiace Centrum & Mobilný Reviewer</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="theme-color" content="#0f172a">
+  <style>
+    :root {
+      --bg: #0b0f19;
+      --card-bg: #161f30;
+      --card-border: #293548;
+      --text: #f8fafc;
+      --text-muted: #94a3b8;
+      --accent: #38bdf8;
+      --success: #22c55e;
+      --warning: #f59e0b;
+      --danger: #ef4444;
+      --font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
+    html, body {
+      background-color: var(--bg);
+      color: var(--text);
+      font-family: var(--font-family);
+      line-height: 1.45;
+      padding-top: 108px;
+      padding-bottom: 90px;
+      overflow-x: hidden;
+      width: 100%;
+    }
+    header {
+      background-color: rgba(15, 23, 42, 0.97);
+      backdrop-filter: blur(10px);
+      -webkit-backdrop-filter: blur(10px);
+      border-bottom: 1px solid var(--card-border);
+      position: fixed;
+      top: 0;
+      left: 0;
+      right: 0;
+      z-index: 1000;
+      padding: 8px 14px;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      box-shadow: 0 4px 14px rgba(0, 0, 0, 0.45);
+    }
+    .header-top {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    .header-title {
+      font-size: 1.02rem;
+      font-weight: 700;
+      color: var(--accent);
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .save-status {
+      font-size: 0.78rem;
+      font-weight: 600;
+      padding: 2px 8px;
+      border-radius: 12px;
+      background: #1e293b;
+      color: var(--success);
+      display: flex;
+      align-items: center;
+      gap: 4px;
+    }
+    .tab-nav {
+      display: flex;
+      background: #090d16;
+      border-radius: 8px;
+      padding: 3px;
+      gap: 4px;
+      border: 1px solid var(--card-border);
+    }
+    .tab-btn {
+      flex: 1;
+      padding: 6px 10px;
+      border-radius: 6px;
+      border: none;
+      background: transparent;
+      color: var(--text-muted);
+      font-size: 0.82rem;
+      font-weight: 700;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 6px;
+      transition: all 0.15s;
+    }
+    .tab-btn.active {
+      background: #1e293b;
+      color: var(--accent);
+      box-shadow: 0 2px 4px rgba(0,0,0,0.3);
+    }
+    .progress-bar-container {
+      width: 100%;
+      height: 5px;
+      background: #1e293b;
+      border-radius: 3px;
+      overflow: hidden;
+    }
+    .progress-bar {
+      height: 100%;
+      background: linear-gradient(90deg, #38bdf8, #22c55e);
+      width: 0%;
+      transition: width 0.3s ease;
+    }
+    .header-stats {
+      font-size: 0.78rem;
+      color: var(--text-muted);
+      display: flex;
+      justify-content: space-between;
+    }
+    .container {
+      max-width: 900px;
+      margin: 0 auto;
+      padding: 12px;
+    }
+    
+    /* PIPELINE SEKCIU ŠTÝLY */
+    .pipeline-view {
+      display: none;
+      flex-direction: column;
+      gap: 16px;
+    }
+    .status-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+      gap: 10px;
+    }
+    .status-card {
+      background: var(--card-bg);
+      border: 1px solid var(--card-border);
+      border-radius: 10px;
+      padding: 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+    .status-card-header {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 0.82rem;
+      color: var(--text-muted);
+      font-weight: 600;
+    }
+    .status-card-val {
+      font-size: 1.05rem;
+      font-weight: 700;
+      color: var(--text);
+    }
+    .status-card-sub {
+      font-size: 0.75rem;
+      color: var(--text-muted);
+    }
+    .pipeline-steps {
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+    .step-card {
+      background: var(--card-bg);
+      border: 1px solid var(--card-border);
+      border-radius: 12px;
+      padding: 14px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+    .step-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    .step-badge {
+      background: #0284c7;
+      color: white;
+      padding: 2px 8px;
+      border-radius: 12px;
+      font-size: 0.75rem;
+      font-weight: 700;
+    }
+    .step-title {
+      font-size: 0.95rem;
+      font-weight: 700;
+      color: var(--text);
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .step-desc {
+      font-size: 0.85rem;
+      color: var(--text-muted);
+    }
+    .step-actions {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex-wrap: wrap;
+      margin-top: 4px;
+    }
+    .btn-step {
+      padding: 8px 16px;
+      border-radius: 8px;
+      font-size: 0.88rem;
+      font-weight: 700;
+      cursor: pointer;
+      border: none;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      transition: all 0.15s;
+    }
+    .btn-step:disabled {
+      opacity: 0.6;
+      cursor: not-allowed;
+    }
+    .btn-primary { background: #0284c7; color: white; }
+    .btn-primary:hover:not(:disabled) { background: #0369a1; }
+    .btn-success { background: #16a34a; color: white; }
+    .btn-success:hover:not(:disabled) { background: #15803d; }
+    .btn-secondary { background: #334155; color: #f8fafc; }
+    .btn-secondary:hover:not(:disabled) { background: #475569; }
+    .step-status-msg {
+      font-size: 0.82rem;
+      font-weight: 600;
+      color: #38bdf8;
+    }
+    .log-modal {
+      background: #080c14;
+      border: 1px solid var(--card-border);
+      border-radius: 10px;
+      padding: 12px;
+      margin-top: 10px;
+      display: none;
+    }
+    .log-modal-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      font-size: 0.82rem;
+      color: var(--accent);
+      font-weight: 700;
+      margin-bottom: 6px;
+    }
+    .log-modal pre {
+      background: #04060a;
+      padding: 10px;
+      border-radius: 6px;
+      color: #e2e8f0;
+      font-size: 0.78rem;
+      font-family: monospace;
+      white-space: pre-wrap;
+      word-break: break-all;
+      max-height: 250px;
+      overflow-y: auto;
+    }
+
+    /* REVIEW VIEW */
+    .review-view {
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+    .filter-panel {
+      background: var(--card-bg);
+      border: 1px solid var(--card-border);
+      border-radius: 10px;
+      padding: 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+    }
+    .search-input {
+      width: 100%;
+      padding: 10px 14px;
+      background: #090d16;
+      border: 1px solid var(--card-border);
+      border-radius: 8px;
+      color: var(--text);
+      font-size: 0.95rem;
+    }
+    .filter-row {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+    select {
+      flex: 1;
+      min-width: 130px;
+      padding: 8px 10px;
+      background: #090d16;
+      border: 1px solid var(--card-border);
+      border-radius: 8px;
+      color: var(--text);
+      font-size: 0.88rem;
+    }
+    .card-list {
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+    .card {
+      background: var(--card-bg);
+      border: 1px solid var(--card-border);
+      border-radius: 12px;
+      padding: 14px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      transition: border-color 0.2s, background-color 0.2s;
+    }
+    .card.approved {
+      border-left: 5px solid var(--success);
+      background: rgba(22, 31, 48, 0.95);
+    }
+    .card.pending {
+      border-left: 5px solid var(--warning);
+    }
+    .card-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      gap: 12px;
+    }
+    .header-info {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      min-width: 0;
+      flex: 1;
+    }
+    .item-meta {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      flex-wrap: wrap;
+    }
+    .item-badge {
+      font-size: 0.88rem;
+      font-weight: 700;
+      color: var(--accent);
+      white-space: nowrap;
+    }
+    .id-tag {
+      background: #090d16;
+      padding: 2px 6px;
+      border-radius: 4px;
+      font-size: 0.75rem;
+      font-family: monospace;
+      color: var(--text-muted);
+      border: 1px solid var(--card-border);
+      white-space: nowrap;
+    }
+    .key-tag {
+      background: #090d16;
+      padding: 3px 8px;
+      border-radius: 4px;
+      font-size: 0.78rem;
+      font-family: monospace;
+      color: #93c5fd;
+      border: 1px solid var(--card-border);
+      word-break: break-all;
+      overflow-wrap: anywhere;
+      width: fit-content;
+      max-width: 100%;
+      line-height: 1.35;
+    }
+    .approve-btn {
+      flex-shrink: 0;
+      white-space: nowrap;
+      margin-left: auto;
+      padding: 8px 14px;
+      border-radius: 20px;
+      font-size: 0.85rem;
+      font-weight: 700;
+      cursor: pointer;
+      border: 1px solid transparent;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      user-select: none;
+      transition: all 0.15s ease;
+    }
+    .approve-btn.approved {
+      background: var(--success);
+      color: #052e16;
+      box-shadow: 0 0 12px rgba(34, 197, 94, 0.35);
+    }
+    .approve-btn.pending {
+      background: #1e293b;
+      color: #cbd5e1;
+      border-color: #475569;
+    }
+    .en-box {
+      font-size: 0.95rem;
+      color: #f1f5f9;
+      background: #090d16;
+      padding: 10px 12px;
+      border-radius: 8px;
+      border: 1px solid #1e293b;
+      word-break: break-word;
+    }
+    .sk-box {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+    .sk-box label {
+      font-size: 0.78rem;
+      color: var(--text-muted);
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+    .sk-input {
+      width: 100%;
+      min-height: 52px;
+      padding: 10px 12px;
+      background: #080c14;
+      border: 1px solid var(--card-border);
+      border-radius: 8px;
+      color: #4ade80;
+      font-size: 0.95rem;
+      font-weight: 600;
+      font-family: inherit;
+      line-height: 1.5;
+      resize: vertical;
+      overflow-y: hidden;
+      box-sizing: border-box;
+    }
+    .sk-input:focus {
+      outline: 2px solid var(--accent);
+      color: #f8fafc;
+      border-color: transparent;
+    }
+    .note-input {
+      width: 100%;
+      min-height: 38px;
+      padding: 8px 12px;
+      background: #080c14;
+      border: 1px solid #334155;
+      border-radius: 8px;
+      color: #fbbf24;
+      font-size: 0.88rem;
+      font-family: inherit;
+      line-height: 1.45;
+      resize: vertical;
+      overflow-y: hidden;
+      box-sizing: border-box;
+    }
+    .note-input:focus {
+      outline: 2px solid #f59e0b;
+      border-color: transparent;
+    }
+    .ctx-text {
+      font-size: 0.78rem;
+      color: #94a3b8;
+      font-style: italic;
+    }
+
+    .mobile-footer {
+      position: fixed;
+      bottom: 0;
+      left: 0;
+      right: 0;
+      background: rgba(15, 23, 42, 0.98);
+      backdrop-filter: blur(10px);
+      -webkit-backdrop-filter: blur(10px);
+      border-top: 1px solid var(--card-border);
+      padding: 10px 16px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 10px;
+      z-index: 100;
+    }
+    .footer-btn {
+      padding: 10px 14px;
+      border-radius: 8px;
+      font-size: 0.88rem;
+      font-weight: 700;
+      cursor: pointer;
+      border: none;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      transition: transform 0.1s;
+    }
+    .footer-btn:active { transform: scale(0.97); }
+    .btn-bulk { background: #334155; color: #f8fafc; }
+    .btn-merge { background: #16a34a; color: white; flex: 1; justify-content: center; }
+
+    .toast {
+      position: fixed;
+      top: 115px;
+      left: 50%;
+      transform: translateX(-50%);
+      background: #16a34a;
+      color: white;
+      padding: 8px 16px;
+      border-radius: 20px;
+      box-shadow: 0 4px 12px rgba(0,0,0,0.4);
+      font-size: 0.85rem;
+      font-weight: 700;
+      opacity: 0;
+      transition: opacity 0.2s;
+      pointer-events: none;
+      z-index: 1100;
+    }
+    .toast.show { opacity: 1; }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="header-top">
+      <div class="header-title">🚚 ETS2 & ATS Lokalizácia</div>
+      <div class="save-status" id="saveIndicator">🟢 Uložené na PC</div>
+    </div>
+    
+    <div class="tab-nav">
+      <button class="tab-btn active" id="tabBtnReview" onclick="switchTab('review')">
+        📝 Preklady na review (<span id="tabCount">0</span>)
+      </button>
+      <button class="tab-btn" id="tabBtnPipeline" onclick="switchTab('pipeline')">
+        ⚙️ Riadiace centrum & Pipeline
+      </button>
+    </div>
+
+    <div class="progress-bar-container">
+      <div class="progress-bar" id="progressBar"></div>
+    </div>
+    <div class="header-stats" id="statsRow">
+      <span>Načítavam stav...</span>
+    </div>
+  </header>
+
+  <div class="container">
+    <!-- TAB 1: REVIEW KARIET -->
+    <div class="review-view" id="reviewView">
+      <div class="filter-panel">
+        <input type="text" id="searchInput" class="search-input" placeholder="🔍 Hľadať v EN, SK, kľúči alebo ID..." oninput="filterItems()">
+        <div class="filter-row">
+          <select id="chapterFilter" onchange="filterItems()">
+            <option value="all">Všetky kapitoly</option>
+            <option value="1">1. Autobusy – Zákazky</option>
+            <option value="2">2. Autobusy – Garáž & Vodič</option>
+            <option value="3">3. Príslušenstvo & Diely</option>
+            <option value="4">4. Laky & Paintjobs</option>
+            <option value="5">5. ATS Pamätihodnosti</option>
+          </select>
+          <select id="statusFilter" onchange="filterItems()">
+            <option value="all">Všetky položky</option>
+            <option value="pending" selected>⏳ Iba na schválenie</option>
+            <option value="approved">✅ Iba schválené</option>
+          </select>
+        </div>
+      </div>
+
+      <div class="card-list" id="cardList"></div>
+    </div>
+
+    <!-- TAB 2: PIPELINE CENTRUM -->
+    <div class="pipeline-view" id="pipelineView">
+      <div class="status-grid">
+        <div class="status-card">
+          <div class="status-card-header">📥 Vstupný súbor XLIFF</div>
+          <div class="status-card-val" id="statInput">Overujem...</div>
+          <div class="status-card-sub" id="statInputSub">-</div>
+        </div>
+        <div class="status-card">
+          <div class="status-card-header">📚 Herné Glosáre</div>
+          <div class="status-card-val" id="statGlossaries">-</div>
+          <div class="status-card-sub">Existujúce termíny ETS2 / ATS</div>
+        </div>
+        <div class="status-card">
+          <div class="status-card-header">⏳ Nepreložené reťazce</div>
+          <div class="status-card-val" id="statUntrans">-</div>
+          <div class="status-card-sub">Pripravené na draft</div>
+        </div>
+        <div class="status-card">
+          <div class="status-card-header">📤 Finálny výstup Crowdinu</div>
+          <div class="status-card-val" id="statOutput">-</div>
+          <div class="status-card-sub" id="statOutputSub">-</div>
+        </div>
+      </div>
+
+      <div class="pipeline-steps">
+        <!-- KROK 1: EXTRAKCIA -->
+        <div class="step-card">
+          <div class="step-header">
+            <div class="step-title">⚡ 1. Extrakcia z nového exportu</div>
+            <span class="step-badge">Krok 1</span>
+          </div>
+          <div class="step-desc">
+            Rozparsuje súbor <code>data/input/SCS Trucks_sk.xliff</code>, obnoví glosáre a extrahuje nové reťazce na preklad do CSV.
+          </div>
+          <div class="step-actions">
+            <button class="btn-step btn-primary" id="btnExtract" onclick="runPipelineAction('extract')">
+              ▶ Spustiť extrakciu
+            </button>
+            <span class="step-status-msg" id="statusExtract"></span>
+          </div>
+        </div>
+
+        <!-- KROK 2: DRAFT -->
+        <div class="step-card">
+          <div class="step-header">
+            <div class="step-title">📋 2. Príprava Review podkladov (Draft)</div>
+            <span class="step-badge">Krok 2</span>
+          </div>
+          <div class="step-desc">
+            Vygeneruje súbor <code>review/preklady_review.md</code>. V ďalších kolách automaticky odfiltruje už schválené položky.
+          </div>
+          <div style="font-size: 0.85rem; color: var(--text-muted); display: flex; align-items: center; gap: 6px;">
+            <input type="checkbox" id="draftIncludeAll" style="accent-color: var(--accent);">
+            <label for="draftIncludeAll">Zahrnúť všetky položky (aj už schválené)</label>
+          </div>
+          <div class="step-actions">
+            <button class="btn-step btn-primary" id="btnDraft" onclick="runPipelineAction('draft')">
+              ▶ Pripraviť Review
+            </button>
+            <span class="step-status-msg" id="statusDraft"></span>
+          </div>
+        </div>
+
+        <!-- KROK 3: REVIEW VYSVETLENIE -->
+        <div class="step-card" style="border-left: 4px solid var(--accent);">
+          <div class="step-header">
+            <div class="step-title">🤖 3. AI Preklad & Tvoje Schvaľovanie</div>
+            <span class="step-badge">Krok 3</span>
+          </div>
+          <div class="step-desc">
+            Návrhy nových prekladov pripraví AI asistent v chate Antigravity. V záložke <b>Preklady na review</b> ich skontroluješ, upravíš a zaškrtneš.
+          </div>
+          <div class="step-actions">
+            <button class="btn-step btn-secondary" onclick="switchTab('review')">
+              🔍 Prejsť na karty prekladov
+            </button>
+            <span class="step-status-msg" id="statusReviewStats"></span>
+          </div>
+        </div>
+
+        <!-- KROK 4: MERGE -->
+        <div class="step-card">
+          <div class="step-header">
+            <div class="step-title">🚀 4. Zlúčenie schválených do XLIFF (Merge)</div>
+            <span class="step-badge">Krok 4</span>
+          </div>
+          <div class="step-desc">
+            Aplikuje zaškrtnuté preklady (<code>- [x]</code>) do výstupného súboru <code>data/output/SCS Trucks_sk_FINAL.xliff</code> pre Crowdin.
+          </div>
+          <div style="font-size: 0.85rem; color: var(--text-muted); display: flex; align-items: center; gap: 6px;">
+            <input type="checkbox" id="mergeIncludeAll" style="accent-color: var(--success);">
+            <label for="mergeIncludeAll">Zlúčiť všetky preklady bez ohľadu na zaškrtnutie</label>
+          </div>
+          <div class="step-actions">
+            <button class="btn-step btn-success" id="btnMerge" onclick="runPipelineAction('merge')">
+              🚀 Spustiť Merge do XLIFF
+            </button>
+            <span class="step-status-msg" id="statusMerge"></span>
+          </div>
+        </div>
+      </div>
+
+      <!-- KONZOLOVÝ LOG VÝSTUP -->
+      <div class="log-modal" id="logModal">
+        <div class="log-modal-header">
+          <span id="logModalTitle">Výstup operácie:</span>
+          <button style="background: none; border: none; color: var(--text-muted); cursor: pointer;" onclick="document.getElementById('logModal').style.display='none'">✕ Zavrieť</button>
+        </div>
+        <pre id="logOutput"></pre>
+      </div>
+    </div>
+  </div>
+
+  <div class="mobile-footer" id="mobileFooter">
+    <button class="footer-btn btn-bulk" onclick="bulkApproveVisible()">✅ Všetko zobrazené</button>
+    <button class="footer-btn btn-merge" onclick="triggerMerge()">🚀 Zlúčiť do XLIFF</button>
+  </div>
+
+  <div class="toast" id="toast">✅ Uložené!</div>
+
+  <script>
+    let currentTab = 'review';
+    let allItems = [];
+    let visibleItems = [];
+    let saveTimeout = null;
+
+    function switchTab(tab) {
+      currentTab = tab;
+      document.getElementById('tabBtnReview').className = 'tab-btn ' + (tab === 'review' ? 'active' : '');
+      document.getElementById('tabBtnPipeline').className = 'tab-btn ' + (tab === 'pipeline' ? 'active' : '');
+      
+      document.getElementById('reviewView').style.display = (tab === 'review' ? 'flex' : 'none');
+      document.getElementById('pipelineView').style.display = (tab === 'pipeline' ? 'flex' : 'none');
+      document.getElementById('mobileFooter').style.display = (tab === 'review' ? 'flex' : 'none');
+
+      if (tab === 'pipeline') {
+        loadPipelineStatus();
+      } else {
+        setTimeout(() => {
+          document.querySelectorAll('.sk-input, .note-input').forEach(autoGrow);
+        }, 50);
+      }
+    }
+
+    async function loadData() {
+      try {
+        const res = await fetch('/api/items');
+        allItems = await res.json();
+      } catch (e) {
+        console.warn('API items nedostupné');
+      }
+      filterItems();
+      loadPipelineStatus();
+    }
+
+    async function loadPipelineStatus() {
+      try {
+        const res = await fetch('/api/status');
+        const st = await res.json();
+        
+        // Input
+        if (st.input && st.input.exists) {
+          document.getElementById('statInput').textContent = `${st.input.size_mb} MB`;
+          document.getElementById('statInputSub').textContent = `Aktualizované: ${st.input.modified}`;
+        } else {
+          document.getElementById('statInput').textContent = '❌ Chýba';
+          document.getElementById('statInputSub').textContent = 'Vložte do data/input/';
+        }
+
+        // Glossaries
+        if (st.glossaries) {
+          document.getElementById('statGlossaries').textContent = 
+            `ETS2: ${st.glossaries.ets2_count.toLocaleString()} | ATS: ${st.glossaries.ats_count.toLocaleString()}`;
+        }
+
+        // Untranslated
+        if (st.untranslated) {
+          document.getElementById('statUntrans').textContent = `${st.untranslated.count} stringov`;
+        }
+
+        // Output & Review
+        if (st.review) {
+          document.getElementById('statusReviewStats').textContent = 
+            `${st.review.approved} / ${st.review.total} schválených (${st.review.percent} %)`;
+        }
+        if (st.output) {
+          const appCnt = st.output.approved_count || 0;
+          document.getElementById('statOutput').textContent = `${appCnt} schválených`;
+          document.getElementById('statOutputSub').textContent = st.output.exists ? `Súbor vygenerovaný (${st.output.size_mb} MB)` : 'Čaká na zlúčenie';
+        }
+
+      } catch (e) {
+        console.warn('Chyba načítania statusu:', e);
+      }
+    }
+
+    async function runPipelineAction(action) {
+      const btn = document.getElementById(action === 'extract' ? 'btnExtract' : (action === 'draft' ? 'btnDraft' : 'btnMerge'));
+      const statusSpan = document.getElementById(action === 'extract' ? 'statusExtract' : (action === 'draft' ? 'statusDraft' : 'statusMerge'));
+      
+      const origText = btn.innerHTML;
+      btn.disabled = true;
+      btn.innerHTML = '⏳ Spracovávam...';
+      statusSpan.textContent = 'Prebieha operácia...';
+
+      let bodyData = {};
+      if (action === 'draft') {
+        bodyData.all = document.getElementById('draftIncludeAll').checked;
+      } else if (action === 'merge') {
+        bodyData.all = document.getElementById('mergeIncludeAll').checked;
+      }
+
+      try {
+        const res = await fetch('/api/' + action, {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify(bodyData)
+        });
+        const data = await res.json();
+        
+        btn.disabled = false;
+        btn.innerHTML = origText;
+
+        // Zobrazenie výstupu do logu
+        const logModal = document.getElementById('logModal');
+        logModal.style.display = 'block';
+        document.getElementById('logModalTitle').textContent = `Výstup: ${action.toUpperCase()}`;
+        document.getElementById('logOutput').textContent = data.output || 'Operácia prebehla bez textového výstupu.';
+
+        if (data.success) {
+          statusSpan.style.color = 'var(--success)';
+          statusSpan.textContent = '✅ Úspešne dokončené!';
+          showToast(`Operácia ${action} bola úspešná!`);
+          await loadData();
+        } else {
+          statusSpan.style.color = 'var(--danger)';
+          statusSpan.textContent = '⚠️ Nastala chyba pri behu!';
+          alert(`Chyba pri ${action}: \n` + (data.output || 'Neznáma chyba'));
+        }
+      } catch (e) {
+        btn.disabled = false;
+        btn.innerHTML = origText;
+        statusSpan.style.color = 'var(--danger)';
+        statusSpan.textContent = '⚠️ Chyba spojenia!';
+        alert('Chyba spojenia: ' + e);
+      }
+    }
+
+    function autoSave() {
+      const ind = document.getElementById('saveIndicator');
+      if (ind) ind.textContent = '⏳ Ukladám...';
+      clearTimeout(saveTimeout);
+      saveTimeout = setTimeout(async () => {
+        try {
+          const res = await fetch('/api/save', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify(allItems)
+          });
+          if (res.ok && ind) {
+            ind.textContent = '🟢 Uložené na PC';
+          }
+        } catch(e) {
+          if (ind) ind.textContent = '⚠️ Režim offline';
+        }
+      }, 350);
+    }
+
+    function updateStats() {
+      const total = allItems.length;
+      const approved = allItems.filter(i => i.approved).length;
+      const pending = total - approved;
+      const pct = total ? ((approved / total) * 100).toFixed(1) : 0;
+      
+      document.getElementById('tabCount').textContent = total;
+      document.getElementById('progressBar').style.width = pct + '%';
+      document.getElementById('statsRow').innerHTML = 
+        `<span>Schválené: <strong>${approved}</strong> / ${total} (${pct} %)</span><span>Zostáva: <strong>${pending}</strong></span>`;
+    }
+
+    function renderCards() {
+      const list = document.getElementById('cardList');
+      if (visibleItems.length === 0) {
+        list.innerHTML = `<div style="text-align: center; padding: 40px; color: var(--text-muted);">
+          Žiadne položky nezodpovedajú filtru.
+        </div>`;
+        updateStats();
+        return;
+      }
+
+      list.innerHTML = visibleItems.map(item => `
+        <div class="card ${item.approved ? 'approved' : 'pending'}" id="card-${item.id}">
+          <div class="card-header">
+            <div class="header-info">
+              <div class="item-meta">
+                <span class="item-badge">[Položka ${item.item_no}]</span>
+                <span class="id-tag">${item.id}</span>
+              </div>
+              ${item.key ? `<div class="key-tag">${item.key}</div>` : ''}
+            </div>
+            <button type="button" class="approve-btn ${item.approved ? 'approved' : 'pending'}" onclick="toggleApprove('${item.id}')">
+              ${item.approved ? '✅ Schválené' : '◯ Schváliť'}
+            </button>
+          </div>
+          <div class="en-box">
+            ${escapeHtml(item.en)}
+          </div>
+          <div class="sk-box">
+            <label>SK Preklad:</label>
+            <textarea class="sk-input" rows="2" placeholder="Zadajte slovenský preklad..." oninput="autoGrow(this); updateTranslation('${item.id}', this.value)">${escapeHtml(item.sk)}</textarea>
+          </div>
+          <div class="sk-box">
+            <label>💬 Poznámka / Komentár:</label>
+            <textarea class="note-input" rows="1" placeholder="Pridaj komentár..." oninput="autoGrow(this); updateNote('${item.id}', this.value)">${escapeHtml(formatNotes(item.notes))}</textarea>
+          </div>
+          ${item.context ? `<div class="ctx-text">${escapeHtml(item.context)}</div>` : ''}
+        </div>
+      `).join('');
+
+      updateStats();
+      setTimeout(() => {
+        document.querySelectorAll('.sk-input, .note-input').forEach(autoGrow);
+      }, 0);
+    }
+
+    function autoGrow(el) {
+      if (!el) return;
+      el.style.height = 'auto';
+      el.style.height = Math.max(el.scrollHeight, 44) + 'px';
+    }
+
+    function filterItems() {
+      const q = document.getElementById('searchInput').value.toLowerCase().trim();
+      const chapter = document.getElementById('chapterFilter').value;
+      const status = document.getElementById('statusFilter').value;
+
+      visibleItems = allItems.filter(item => {
+        if (status === 'approved' && !item.approved) return false;
+        if (status === 'pending' && item.approved) return false;
+
+        if (chapter !== 'all') {
+          if (!item.chapter.startsWith(chapter + '.')) return false;
+        }
+
+        if (q) {
+          const matchEn = (item.en || '').toLowerCase().includes(q);
+          const matchSk = (item.sk || '').toLowerCase().includes(q);
+          const matchId = (item.id || '').toLowerCase().includes(q);
+          const matchKey = (item.key || '').toLowerCase().includes(q);
+          if (!matchEn && !matchSk && !matchId && !matchKey) return false;
+        }
+
+        return true;
+      });
+
+      renderCards();
+    }
+
+    function toggleApprove(id) {
+      const it = allItems.find(i => i.id === id);
+      if (it) {
+        it.approved = !it.approved;
+        const card = document.getElementById('card-' + id);
+        if (card) {
+          card.className = 'card ' + (it.approved ? 'approved' : 'pending');
+          const btn = card.querySelector('.approve-btn');
+          btn.className = 'approve-btn ' + (it.approved ? 'approved' : 'pending');
+          btn.textContent = it.approved ? '✅ Schválené' : '◯ Schváliť';
+        }
+        updateStats();
+        autoSave();
+      }
+    }
+
+    function updateTranslation(id, val) {
+      const it = allItems.find(i => i.id === id);
+      if (it) {
+        // Zákaz en-dash a em-dash
+        val = val.replace(/\u2013/g, '-').replace(/\u2014/g, '-');
+        it.sk = val;
+        autoSave();
+      }
+    }
+
+    function updateNote(id, val) {
+      const it = allItems.find(i => i.id === id);
+      if (it) {
+        val = val.trim();
+        it.notes = val ? ['> ' + val] : [];
+        autoSave();
+      }
+    }
+
+    function formatNotes(notes) {
+      if (!notes || notes.length === 0) return '';
+      return notes.map(n => n.replace(/^>\s*/, '').replace(/^\*\s*\*(Poznámka|Komentár):\*\s*/, '')).join('; ');
+    }
+
+    function bulkApproveVisible() {
+      if (!confirm('Chcete označiť všetky zobrazené položky (' + visibleItems.length + ') ako schválené?')) return;
+      visibleItems.forEach(it => { it.approved = true; });
+      renderCards();
+      autoSave();
+      showToast('Označených ' + visibleItems.length + ' položiek');
+    }
+
+    async function triggerMerge() {
+      const approvedCount = allItems.filter(i => i.approved).length;
+      if (approvedCount === 0) {
+        alert('Najprv označte aspoň jednu položku ako schválenú.');
+        return;
+      }
+      if (!confirm('Zlúčiť ' + approvedCount + ' schválených položiek do SCS Trucks_sk_FINAL.xliff?')) return;
+      
+      showToast('Zlučujem do XLIFF...');
+      runPipelineAction('merge');
+    }
+
+    function showToast(msg) {
+      const t = document.getElementById('toast');
+      t.textContent = msg;
+      t.classList.add('show');
+      setTimeout(() => t.classList.remove('show'), 2500);
+    }
+
+    function escapeHtml(str) {
+      if (!str) return '';
+      return str.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+    }
+
+    window.onload = loadData;
+  </script>
+</body>
+</html>
+"""
+
+class ReviewHandler(BaseHTTPRequestHandler):
+    def send_cors_headers(self):
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+
+    def do_OPTIONS(self):
+        self.send_response(200)
+        self.send_cors_headers()
+        self.end_headers()
+
+    def do_GET(self):
+        parsed = urlparse(self.path)
+        if parsed.path in ("/", "/index.html"):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_cors_headers()
+            self.end_headers()
+            self.wfile.write(HTML_TEMPLATE.encode("utf-8"))
+        elif parsed.path == "/api/items":
+            items = load_data()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_cors_headers()
+            self.end_headers()
+            self.wfile.write(json.dumps(items, ensure_ascii=False).encode("utf-8"))
+        elif parsed.path == "/api/status":
+            st = get_pipeline_status()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_cors_headers()
+            self.end_headers()
+            self.wfile.write(json.dumps(st, ensure_ascii=False).encode("utf-8"))
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def do_POST(self):
+        parsed = urlparse(self.path)
+        content_length = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(content_length).decode("utf-8") if content_length > 0 else "{}"
+        try:
+            req_data = json.loads(body)
+        except Exception:
+            req_data = {}
+
+        if parsed.path == "/api/save":
+            save_data(req_data)
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_cors_headers()
+            self.end_headers()
+            self.wfile.write(b'{"success": true}')
+
+        elif parsed.path == "/api/extract":
+            try:
+                cmd = [sys.executable, os.path.join("scripts", "extract.py")]
+                res = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_cors_headers()
+                self.end_headers()
+                out_msg = res.stdout if res.returncode == 0 else (res.stderr or res.stdout)
+                self.wfile.write(json.dumps({
+                    "success": (res.returncode == 0),
+                    "output": out_msg,
+                    "status": get_pipeline_status()
+                }).encode("utf-8"))
+            except Exception as e:
+                self.send_response(500)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_cors_headers()
+                self.end_headers()
+                self.wfile.write(json.dumps({"success": False, "output": str(e)}).encode("utf-8"))
+
+        elif parsed.path == "/api/draft":
+            try:
+                cmd = [sys.executable, os.path.join("scripts", "prepare_review.py")]
+                if req_data.get("all"):
+                    cmd.append("--all")
+                res = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_cors_headers()
+                self.end_headers()
+                out_msg = res.stdout if res.returncode == 0 else (res.stderr or res.stdout)
+                self.wfile.write(json.dumps({
+                    "success": (res.returncode == 0),
+                    "output": out_msg,
+                    "status": get_pipeline_status()
+                }).encode("utf-8"))
+            except Exception as e:
+                self.send_response(500)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_cors_headers()
+                self.end_headers()
+                self.wfile.write(json.dumps({"success": False, "output": str(e)}).encode("utf-8"))
+
+        elif parsed.path == "/api/merge":
+            try:
+                cmd = [sys.executable, os.path.join("scripts", "merge_to_xliff.py")]
+                if req_data.get("all"):
+                    cmd.append("--all")
+                res = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_cors_headers()
+                self.end_headers()
+                out_msg = res.stdout if res.returncode == 0 else (res.stderr or res.stdout)
+                self.wfile.write(json.dumps({
+                    "success": (res.returncode == 0),
+                    "output": out_msg,
+                    "status": get_pipeline_status()
+                }).encode("utf-8"))
+            except Exception as e:
+                self.send_response(500)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_cors_headers()
+                self.end_headers()
+                self.wfile.write(json.dumps({"success": False, "output": str(e)}).encode("utf-8"))
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def log_message(self, format, *args):
+        pass
+
+def start_server():
+    port = get_free_port(8080)
+    server = HTTPServer(('0.0.0.0', port), ReviewHandler)
+    local_ip = get_local_ip()
+    local_url = f"http://127.0.0.1:{port}"
+    mobile_url = f"http://{local_ip}:{port}"
+    
+    print("=" * 65)
+    print("🚚 ETS2 & ATS RIADIACE CENTRUM & REVIEW (PC & MOBIL)")
+    print("=" * 65)
+    print(f"💻 Na PC:     {local_url}")
+    print(f"📱 Na mobile: {mobile_url}  (Wi-Fi sieť)")
+    print("=" * 65)
+    print("Každé zaškrtnutie na mobile sa okamžite automaticky ukladá na PC.")
+    print("Pre ukončenie stlačte Ctrl+C v termináli.")
+    print("=" * 65)
+    
+    try:
+        webbrowser.open(local_url)
+    except Exception:
+        pass
+
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nServer bol ukončený.")
+
+if __name__ == "__main__":
+    start_server()
